@@ -57,7 +57,7 @@ def canonicalize_clusters(
     return [list(c) for c in merged_clusters]
 
 
-@DatasetReader.register("coref-using-qa")
+@DatasetReader.register("coref_using_qa")
 class ConllCorefQAReader(DatasetReader):
     """
     Reads a single CoNLL-formatted file. This is the same file format as used in the
@@ -122,7 +122,7 @@ class ConllCorefQAReader(DatasetReader):
 
         self._start_of_mention = "<mention>"
         self._end_of_mention = "</mention>"
-        self._tokenizer.add_tokens([self._start_of_mention, self._end_of_mention])
+        self._tokenizer.tokenizer.add_tokens([self._start_of_mention, self._end_of_mention])
 
     @overrides
     def _read(self, file_path: str):
@@ -192,13 +192,6 @@ class ConllCorefQAReader(DatasetReader):
 
         cluster_dict: Dict[Tuple[int, int], int] = {}
         if gold_clusters is not None:
-            if self._wordpiece_modeling:
-                for cluster in gold_clusters:
-                    for mention_id, mention in enumerate(cluster):
-                        start = offsets[mention[0]][0]
-                        end = offsets[mention[1]][1]
-                        cluster[mention_id] = (start, end)
-
             for cluster_id, cluster in enumerate(gold_clusters):
                 for mention in cluster:
                     cluster_dict[tuple(mention)] = cluster_id  # type: ignore
@@ -233,8 +226,8 @@ class ConllCorefQAReader(DatasetReader):
                         continue
 
                 if span_labels is not None:
-                    if (start, end) in cluster_dict:
-                        span_labels.append(cluster_dict[(start, end)])
+                    if (orig_start, orig_end) in cluster_dict:
+                        span_labels.append(cluster_dict[(orig_start, orig_end)])
                     else:
                         span_labels.append(-1)
 
@@ -254,6 +247,12 @@ class ConllCorefQAReader(DatasetReader):
 
         metadata: Dict[str, Any] = {"original_text": flattened_sentences}
         if gold_clusters is not None:
+            if self._wordpiece_modeling:
+                for cluster in gold_clusters:
+                    for mention_id, mention in enumerate(cluster):
+                        start = offsets[mention[0]][0]
+                        end = offsets[mention[1]][1]
+                        cluster[mention_id] = (start, end)
             metadata["clusters"] = gold_clusters
         metadata_field = MetadataField(metadata)
 
@@ -271,7 +270,7 @@ class ConllCorefQAReader(DatasetReader):
 
     def _prepare_qa_input(
         self, sentences: List[List[str]], curr_span_start: int, curr_span_end: int, cluster_dict: Dict[Tuple[int, int], int]
-    ) -> Tuple[ListField[TextField], ListField[ListField[TextField]]]:
+    ) -> Tuple[ListField[TextField], ListField[SequenceLabelField]]:
         # Find curr sentence
         start_offset = 0
         curr_sentence = None
@@ -280,11 +279,12 @@ class ConllCorefQAReader(DatasetReader):
             if start_offset <= curr_span_start <= curr_span_end < end:
                 curr_sentence = sentence
                 break
+            start_offset = end
         assert curr_sentence is not None
 
         # Find coreferents
-        cluster_id = cluster_dict[(curr_span_start, curr_span_end)]
-        coreferents = {mention for mention, mention_cluster_id in cluster_dict.items() if mention_cluster_id == cluster_id}
+        cluster_id = cluster_dict.get((curr_span_start, curr_span_end), -1)
+        coreferents = {mention for mention, mention_cluster_id in cluster_dict.items() if mention_cluster_id == cluster_id and mention != (curr_span_start, curr_span_end)}
 
         rel_span_start = curr_span_start - start_offset
         rel_span_end = curr_span_end - start_offset
@@ -302,7 +302,7 @@ class ConllCorefQAReader(DatasetReader):
         # Prepare context and answers
         context = [word for sentence in sentences for word in sentence]
         pre_context_offset = self._tokenizer.num_added_start_tokens + len(tokenized_question) + self._tokenizer.num_added_middle_tokens
-        tokenized_context, context_offsets, _ = self._tokenizer.intra_word_tokenize_in_id(context, pre_context_offset)
+        tokenized_context, context_offsets, _ = self._tokenizer.intra_word_tokenize_in_id(context)
         coreferents = {(context_offsets[start][0], context_offsets[end][1]) for start, end in coreferents}
 
         n_added_tokens = self._tokenizer.num_added_start_tokens + self._tokenizer.num_added_middle_tokens + self._tokenizer.num_added_end_tokens
@@ -321,16 +321,21 @@ class ConllCorefQAReader(DatasetReader):
             qa_text_fields.append(qa_text_field)
 
             # Prepare answers
-            coreferents_in_window = [  # filter and adjust indices
-                (start - segment_start + pre_context_offset, end - segment_start + pre_context_offset)
-                for start, end in coreferents
-                if segment_start <= start <= end < segment_end
-            ]
-            coreferents_in_window = ListField([
-                SpanField(start, end, qa_text_field)
-                for start, end in coreferents_in_window
-            ])
-            qa_answers.append(coreferents_in_window)
+            answers = ['O'] * len(tokens)
+            for start, end in coreferents:
+                # Do not consider out of window ones
+                if not segment_start <= start <= end < segment_end:
+                    continue
+                # Adjust indices for (1) window offset and (2) pre context offset
+                start = start - segment_start + pre_context_offset
+                end = end - segment_start + pre_context_offset
+                if answers[start] == 'O':  # Do not overwrite 'I' with 'B'
+                    answers[start] = 'B'
+                if end > start:
+                    answers[start + 1 : end + 1] = ['I'] * (end - start)
+            if qa_text_field.sequence_length() != len(answers):
+                breakpoint()
+            qa_answers.append(SequenceLabelField(answers, qa_text_field))
 
         return ListField(qa_text_fields), ListField(qa_answers)
 
