@@ -123,6 +123,7 @@ class ConllCorefQAReader(DatasetReader):
         self._start_of_mention = "<mention>"
         self._end_of_mention = "</mention>"
         self._tokenizer.tokenizer.add_tokens([self._start_of_mention, self._end_of_mention])
+        self._start_of_mention_id, self._end_of_mention_id = self._tokenizer.tokenizer.convert_tokens_to_ids([self._start_of_mention, self._end_of_mention])
 
     @overrides
     def _read(self, file_path: str):
@@ -198,11 +199,11 @@ class ConllCorefQAReader(DatasetReader):
 
         spans: List[Field] = []
         span_labels: Optional[List[int]] = [] if gold_clusters is not None else None
-        all_questions_with_contexts: List[Field] = []
-        all_answers: List[Field] = []
+        all_orig_spans: List[List[Tuple[int, int]]] = []
 
         sentence_offset = 0
         for sentence in sentences:
+            orig_spans = []
             for start, end in enumerate_spans(
                 sentence, offset=sentence_offset, max_span_width=self._max_span_width
             ):
@@ -232,18 +233,13 @@ class ConllCorefQAReader(DatasetReader):
                         span_labels.append(-1)
 
                 spans.append(SpanField(start, end, text_field))
-
-                questions_with_contexts, answers = self._prepare_qa_input(
-                    sentences, orig_start, orig_end, cluster_dict
-                )
-                all_questions_with_contexts.append(questions_with_contexts)
-                all_answers.append(answers)
+                orig_spans.append((orig_start, orig_end))
 
             sentence_offset += len(sentence)
+            all_orig_spans.append(orig_spans)
 
         span_field = ListField(spans)
-        all_questions_with_contexts_field = ListField(all_questions_with_contexts)
-        all_answers_field = ListField(all_answers)
+        all_questions_with_contexts_field, all_answers_field = self._prepare_doc_qa_input(sentences, all_orig_spans, cluster_dict)
 
         metadata: Dict[str, Any] = {"original_text": flattened_sentences}
         if gold_clusters is not None:
@@ -268,57 +264,78 @@ class ConllCorefQAReader(DatasetReader):
 
         return Instance(fields)
 
-    def _prepare_qa_input(
-        self, sentences: List[List[str]], curr_span_start: int, curr_span_end: int, cluster_dict: Dict[Tuple[int, int], int]
-    ) -> Tuple[ListField[TextField], ListField[SequenceLabelField]]:
-        # Find curr sentence
-        start_offset = 0
-        curr_sentence = None
+    def _prepare_doc_qa_input(
+        self, sentences: List[List[str]], all_spans: List[List[Tuple[int, int]]], cluster_dict: Dict[Tuple[int, int], int]
+    ) -> Tuple[ListField[ListField[TextField]], ListField[ListField[SequenceLabelField]]]:
+        assert len(sentences) == len(all_spans)
+
+        # Convert sentences to be wordpiece-based
+        sentence_offset = 0
+        tokenized_sentences = []
+        all_wordpiece_offsets = []
         for sentence in sentences:
-            end = start_offset + len(sentence)
-            if start_offset <= curr_span_start <= curr_span_end < end:
-                curr_sentence = sentence
-                break
-            start_offset = end
-        assert curr_sentence is not None
+            tokenized_sentence, wordpiece_offsets, _ = self._tokenizer.intra_word_tokenize_in_id(sentence, starting_offset=sentence_offset)
+            tokenized_sentences.append(tokenized_sentence)
+            all_wordpiece_offsets.extend(wordpiece_offsets)
+            sentence_offset += len(tokenized_sentence)
 
-        # Find coreferents
-        cluster_id = cluster_dict.get((curr_span_start, curr_span_end), -1)
-        coreferents = {mention for mention, mention_cluster_id in cluster_dict.items() if mention_cluster_id == cluster_id and mention != (curr_span_start, curr_span_end)}
+        def offset_span(span):
+            start, end = span
+            return all_wordpiece_offsets[start][0], all_wordpiece_offsets[end][1]
 
-        rel_span_start = curr_span_start - start_offset
-        rel_span_end = curr_span_end - start_offset
+        # Convert cluster_dict and all_spans to be wordpiece-based
+        cluster_dict = {offset_span(span): cluster_id for span, cluster_id in cluster_dict.items()}
+        all_spans = [[offset_span(span) for span in spans] for spans in all_spans]
 
+        tokenized_context = [token for tokenized_sentence in tokenized_sentences for token in tokenized_sentence]
+
+        all_questions_with_contexts: List[Field] = []
+        all_answers: List[Field] = []
+
+        sentence_offset = 0
+        for tokenized_sentence, spans in zip(tokenized_sentences, all_spans):
+            for span in spans:
+                # Find coreferents
+                cluster_id = cluster_dict.get(span, -1)
+                coreferents = [mention for mention, mention_cluster_id in cluster_dict.items() if mention_cluster_id == cluster_id and mention != span]
+
+                span = [i - sentence_offset for i in span]  # convert to relative indices
+                questions_with_contexts, answers = self._prepare_single_qa_input(tokenized_sentence, tokenized_context, span, coreferents)
+                all_questions_with_contexts.append(questions_with_contexts)
+                all_answers.append(answers)
+
+            sentence_offset += len(tokenized_sentence)
+
+        return ListField(all_questions_with_contexts), ListField(all_answers)
+
+    def _prepare_single_qa_input(
+        self, curr_sentence: List[int], context: List[int], curr_span: Tuple[int, int], coreferents: List[Tuple[int, int]],
+    ) -> Tuple[ListField[TextField], ListField[SequenceLabelField]]:
+        curr_span_start, curr_span_end = curr_span
         # Prepare question
-        question = curr_sentence[:rel_span_start] + [self._start_of_mention] + curr_sentence[rel_span_start:rel_span_end+1] + [self._end_of_mention] + curr_sentence[rel_span_end+1:]
-        tokenized_question, _, _ = self._tokenizer.intra_word_tokenize_in_id(question)
-
+        question = curr_sentence[:curr_span_start] + [self._start_of_mention_id] + curr_sentence[curr_span_start:curr_span_end+1] + [self._end_of_mention_id] + curr_sentence[curr_span_end+1:]
         # Strip question from the end until hitting self._end_of_mention, then strip from the start
-        n_tokens_to_strip = len(tokenized_question) - self._max_question_length
-        n_strip_at_end = min(n_tokens_to_strip, len(tokenized_question) - rel_span_end + 1)
+        n_tokens_to_strip = len(question) - self._max_question_length
+        n_strip_at_end = min(n_tokens_to_strip, len(question) - curr_span_end + 1)
         n_strip_at_start = n_tokens_to_strip - n_strip_at_end
-        tokenized_question = tokenized_question[n_strip_at_start:-n_strip_at_end]
+        question = question[n_strip_at_start:-n_strip_at_end]
 
         # Prepare context and answers
-        context = [word for sentence in sentences for word in sentence]
-        pre_context_offset = self._tokenizer.num_added_start_tokens + len(tokenized_question) + self._tokenizer.num_added_middle_tokens
-        tokenized_context, context_offsets, _ = self._tokenizer.intra_word_tokenize_in_id(context)
-        coreferents = {(context_offsets[start][0], context_offsets[end][1]) for start, end in coreferents}
-
+        pre_context_offset = self._tokenizer.num_added_start_tokens + len(question) + self._tokenizer.num_added_middle_tokens
         n_added_tokens = self._tokenizer.num_added_start_tokens + self._tokenizer.num_added_middle_tokens + self._tokenizer.num_added_end_tokens
-        max_context_length = self._max_qa_length - len(tokenized_question) - n_added_tokens
+        max_context_length = self._max_qa_length - len(question) - n_added_tokens
 
         # Windowing
-        qa_text_fields: List[Field] = []
+        questions_with_contexts: List[Field] = []
         qa_answers: List[Field] = []
         for i in range(math.ceil(len(context) / max_context_length)):
             segment_start = i * max_context_length
             segment_end = (i + 1) * max_context_length  # exclusive
-            context_segment = tokenized_context[segment_start:segment_end]
+            context_segment = context[segment_start:segment_end]
 
-            tokens = self._tokenizer.ids_to_tokens(tokenized_question, context_segment)
-            qa_text_field = TextField(tokens, self._qa_indexers)
-            qa_text_fields.append(qa_text_field)
+            tokens = self._tokenizer.ids_to_tokens(question, context_segment)
+            question_with_context = TextField(tokens, self._qa_indexers)
+            questions_with_contexts.append(question_with_context)
 
             # Prepare answers
             answers = ['O'] * len(tokens)
@@ -333,11 +350,10 @@ class ConllCorefQAReader(DatasetReader):
                     answers[start] = 'B'
                 if end > start:
                     answers[start + 1 : end + 1] = ['I'] * (end - start)
-            if qa_text_field.sequence_length() != len(answers):
-                breakpoint()
-            qa_answers.append(SequenceLabelField(answers, qa_text_field))
 
-        return ListField(qa_text_fields), ListField(qa_answers)
+            qa_answers.append(SequenceLabelField(answers, question_with_context))
+
+        return ListField(questions_with_contexts), ListField(qa_answers)
 
     @staticmethod
     def _normalize_word(word):
