@@ -1,1 +1,2 @@
 from allennlp.models.coreference_resolution.coref import CoreferenceResolver
+from allennlp.models.coreference_resolution.mention_pruner import MentionPruner
