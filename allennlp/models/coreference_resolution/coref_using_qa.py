@@ -8,9 +8,10 @@ from overrides import overrides
 
 from allennlp.data import TextFieldTensors, Vocabulary
 from allennlp.models.model import Model
-from allennlp.modules.token_embedders import Embedding
+from allennlp.modules.text_field_embedders import BasicTextFieldEmbedder
+from allennlp.modules.token_embedders import Embedding, PretrainedTransformerEmbedder, PretrainedTransformerMismatchedEmbedder
 from allennlp.modules import FeedForward
-from allennlp.modules import Seq2SeqEncoder, TimeDistributed, TextFieldEmbedder, Pruner
+from allennlp.modules import Seq2SeqEncoder, TimeDistributed, Pruner
 from allennlp.modules.span_extractors import SelfAttentiveSpanExtractor, EndpointSpanExtractor
 from allennlp.nn import util, InitializerApplicator
 from allennlp.training.metrics import MentionRecall, ConllCorefScores
@@ -18,8 +19,8 @@ from allennlp.training.metrics import MentionRecall, ConllCorefScores
 logger = logging.getLogger(__name__)
 
 
-@Model.register("coref")
-class CoreferenceResolver(Model):
+@Model.register("coref_using_qa")
+class CoreferenceQAResolver(Model):
     """
     This `Model` implements the coreference resolution model described "End-to-end Neural
     Coreference Resolution"
@@ -31,10 +32,12 @@ class CoreferenceResolver(Model):
     span (if any) they are coreferent with. The resulting coreference links, after applying
     transitivity, imply a clustering of the spans in the document.
 
+    TODO: change
+
     # Parameters
 
     vocab : `Vocabulary`
-    text_field_embedder : `TextFieldEmbedder`
+    text_field_embedder : `BasicTextFieldEmbedder`
         Used to embed the `text` `TextField` we get as input to the model.
     context_layer : `Seq2SeqEncoder`
         This layer incorporates contextual information for each word in the document.
@@ -62,7 +65,7 @@ class CoreferenceResolver(Model):
     def __init__(
         self,
         vocab: Vocabulary,
-        text_field_embedder: TextFieldEmbedder,
+        transformer_model_name: str,
         context_layer: Seq2SeqEncoder,
         mention_feedforward: FeedForward,
         antecedent_feedforward: FeedForward,
@@ -70,13 +73,27 @@ class CoreferenceResolver(Model):
         max_span_width: int,
         spans_per_word: float,
         max_antecedents: int,
+        wordpiece_modeling: bool = True,
         lexical_dropout: float = 0.2,
         initializer: InitializerApplicator = InitializerApplicator(),
+        embeder_kwargs: Dict[str, Any] = None,
         **kwargs
     ) -> None:
         super().__init__(vocab, **kwargs)
 
-        self._text_field_embedder = text_field_embedder
+        base_embeder_cls = PretrainedTransformerEmbedder if self._wordpiece_modeling else PretrainedTransformerMismatchedEmbedder
+        qa_embeder_cls = PretrainedTransformerEmbedder  # have to do matched version for QA
+        embeder_kwargs = embeder_kwargs or {}
+
+        self._base_embedder = base_embeder_cls(transformer_model_name, **embeder_kwargs)
+        self._qa_embedder = qa_embeder_cls(transformer_model_name, **embeder_kwargs)
+        # Add <mention> and </mention> to vocabulary
+        curr_vocab_size = self._base_embedder.transformer_model.config.vocab_size
+        self._base_embedder.transformer_model.resize_token_embeddings(curr_vocab_size + 2)
+        self._qa_embedder.transformer_model = self._base_embedder.transformer_model  # share params
+        self._base_embedder = {"tokens": self._base_embedder}
+        self._qa_embedder = {"tokens": self._qa_embedder}
+
         self._context_layer = context_layer
         self._antecedent_feedforward = TimeDistributed(antecedent_feedforward)
         feedforward_scorer = torch.nn.Sequential(
@@ -120,6 +137,8 @@ class CoreferenceResolver(Model):
         self,  # type: ignore
         text: TextFieldTensors,
         spans: torch.IntTensor,
+        questions_with_contexts: TextFieldTensors,
+        answers: TextFieldTensors,
         span_labels: torch.IntTensor = None,
         metadata: List[Dict[str, Any]] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -158,6 +177,7 @@ class CoreferenceResolver(Model):
         loss : `torch.FloatTensor`, optional
             A scalar loss to be optimised.
         """
+        breakpoint()
         # Shape: (batch_size, document_length, embedding_size)
         text_embeddings = self._lexical_dropout(self._text_field_embedder(text))
 

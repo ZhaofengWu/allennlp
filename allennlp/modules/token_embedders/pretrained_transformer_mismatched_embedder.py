@@ -29,6 +29,7 @@ class PretrainedTransformerMismatchedEmbedder(TokenEmbedder):
         super().__init__()
         # The matched version v.s. mismatched
         self._matched_embedder = PretrainedTransformerEmbedder(model_name, max_length)
+        self.transformer_model = self._matched_embedder.transformer_model
 
     @overrides
     def get_output_dim(self):
