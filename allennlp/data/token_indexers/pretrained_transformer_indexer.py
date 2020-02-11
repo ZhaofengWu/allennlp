@@ -36,6 +36,8 @@ class PretrainedTransformerIndexer(TokenIndexer):
         before feeding into the embedder. The embedder embeds these segments independently and
         concatenate the results to get the original document representation. Should be set to
         the same value as the `max_length` option on the `PretrainedTransformerEmbedder`.
+        This option currently only supports single sequence, so the client is expected to handle
+        sequence pair truncation or splitting.
     """
 
     def __init__(
@@ -140,11 +142,13 @@ class PretrainedTransformerIndexer(TokenIndexer):
         The input should have a `"token_ids"` key corresponding to the token indices. They should
         have special tokens already inserted.
         """
-        if self._max_length is not None:
+        if self._max_length is not None and len(output["token_ids"]) > self._effective_max_length:
             # We prepare long indices by converting them to (assuming max_length == 5)
             # [CLS] A B C [SEP] [CLS] D E F [SEP] ...
             # Embedder is responsible for folding this 1-d sequence to 2-d and feed to the
             # transformer model.
+            # We shouldn't touch the output is the length is within the requirement, otherwise
+            # we could accidentally overwrite e.g. type_ids for sequence pairs.
             # TODO(zhaofengw): we aren't respecting word boundaries when segmenting wordpieces.
 
             indices = output["token_ids"]

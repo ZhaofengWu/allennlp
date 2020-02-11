@@ -7,7 +7,6 @@ from overrides import overrides
 import torch
 
 from allennlp.common.file_utils import cached_path
-from allennlp.data import TextFieldTensors
 from allennlp.data.dataset_readers.dataset_reader import DatasetReader
 from allennlp.data.fields import (
     Field,
@@ -18,11 +17,14 @@ from allennlp.data.fields import (
     SequenceLabelField,
 )
 from allennlp.data.instance import Instance
+from allennlp.data.fields.text_field import TextFieldTensors
 from allennlp.data.tokenizers import Token, PretrainedTransformerTokenizer
 from allennlp.data.token_indexers import PretrainedTransformerIndexer, TokenIndexer
 from allennlp.data.dataset_readers.dataset_utils import Ontonotes, enumerate_spans
 
 logger = logging.getLogger(__name__)
+
+B, I, O = 0, 1, 2
 
 
 def canonicalize_clusters(
@@ -189,6 +191,7 @@ class ConllCorefQAReader(DatasetReader):
                     end = offsets[mention[1]][1]
                     cluster[mention_id] = (start, end)
 
+            cluster_dict = {}
             for cluster_id, cluster in enumerate(gold_clusters):
                 for mention in cluster:
                     cluster_dict[tuple(mention)] = cluster_id  # type: ignore
@@ -221,7 +224,7 @@ class ConllCorefQAReader(DatasetReader):
 
         metadata: Dict[str, Any] = {
             "original_text": flattened_sentences,
-            "prepare_qa_input_output_function": lambda spans: self._prepare_single_qa_input_output(tokenized_sentences, spans, cluster_dict)
+            "prepare_qa_input_output_function": lambda spans, vocab: self._prepare_qa_input_output(tokenized_sentences, spans, vocab, cluster_dict)
         }
         if gold_clusters is not None:
             metadata["clusters"] = gold_clusters
@@ -253,28 +256,32 @@ class ConllCorefQAReader(DatasetReader):
         return tokenized_sentences, all_wordpiece_offsets, flat_sentences_tokens
 
     def _prepare_qa_input_output(
-        self, tokenized_sentences: List[List[int]], spans: torch.LongTensor, cluster_dict: Dict[Tuple[int, int], int] = None
-    ) -> TextFieldTensors, torch.LongTensor:
+        self, tokenized_sentences: List[List[int]], spans: torch.LongTensor, vocab, cluster_dict: Dict[Tuple[int, int], int] = None
+    ) -> Tuple[TextFieldTensors, torch.LongTensor]:
         """
-        spans: (batch_size, 2)
+        spans: (num_spans, 2)
 
         # Returns
 
-        (batch_size, num_segments, max_qa_length)
-        (batch_size, num_segments, max_qa_length, num_classes)
+        (num_spans, num_segments, max_qa_length)
+        (num_spans, num_segments, max_qa_length, num_classes)
         """
-        batch_size = spans.size(0)
+        num_spans = spans.size(0)
         device = spans.device
-        spans_sentence_index = torch.zeros(batch_size, device=device)
+        spans_sentence_index = torch.zeros(num_spans, dtype=torch.long, device=device)
         spans_relative_indices = torch.zeros_like(spans)
-        finished_spans = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        finished_spans = torch.zeros(num_spans, dtype=torch.bool, device=device)
 
         sentence_offset = self._tokenizer.num_added_start_tokens
         for sentence_idx, sentence in enumerate(tokenized_sentences):
-            curr_sentence_spans = (~finished_spans) & (spans - len(sentence) < 0)
+            unmasked_curr_sentence_spans = spans - len(sentence) < 0
+            curr_sentence_spans = (~finished_spans) & unmasked_curr_sentence_spans.all(1)
+            assert (curr_sentence_spans == (~finished_spans) & unmasked_curr_sentence_spans.any(1)).all()
             spans_sentence_index[curr_sentence_spans] = sentence_idx
-            spans_relative_indices[curr_sentence_spans] -= sentence_offset
+            spans_relative_indices[curr_sentence_spans] = spans[curr_sentence_spans] - sentence_offset
             finished_spans[curr_sentence_spans] = 1
+
+            spans -= len(sentence)
             sentence_offset += len(sentence)
 
         assert finished_spans.all()
@@ -287,7 +294,7 @@ class ConllCorefQAReader(DatasetReader):
 
         for sentence_idx, span in zip(spans_sentence_index, spans_relative_indices):
             sentence = tokenized_sentences[sentence_idx]
-            span = span.tolist()
+            span = tuple(span.tolist())
 
             # Find coreferents
             coreferents = None
@@ -302,8 +309,10 @@ class ConllCorefQAReader(DatasetReader):
 
         input_field = ListField(all_questions_with_contexts)
         output_field = ListField(all_answers)
+        input_field.index(vocab)
+        output_field.index(vocab)
 
-        return input_field.as_tensor(), output_field.as_tensor()
+        return input_field.as_tensor(input_field.get_padding_lengths()), output_field.as_tensor(output_field.get_padding_lengths())
 
     def _prepare_single_qa_input_output(
         self, curr_sentence: List[int], context: List[int], curr_span: Tuple[int, int], coreferents: List[Tuple[int, int]] = None,
@@ -337,7 +346,7 @@ class ConllCorefQAReader(DatasetReader):
 
             if coreferents is not None:
                 # Prepare answers
-                answers = ['O'] * len(tokens)
+                answers = [O] * len(tokens)
                 for start, end in coreferents:
                     # Do not consider out of window ones
                     if not segment_start <= start <= end < segment_end:
@@ -345,16 +354,16 @@ class ConllCorefQAReader(DatasetReader):
                     # Adjust indices for (1) window offset and (2) pre context offset
                     start = start - segment_start + pre_context_offset
                     end = end - segment_start + pre_context_offset
-                    if answers[start] == 'O':  # Do not overwrite 'I' with 'B'
-                        answers[start] = 'B'
+                    if answers[start] == O:  # Do not overwrite I with B
+                        answers[start] = B
                     if end > start:
-                        answers[start + 1 : end + 1] = ['I'] * (end - start)
+                        answers[start + 1 : end + 1] = [I] * (end - start)
 
                 qa_answers.append(SequenceLabelField(answers, question_with_context))
 
-        output = {"questions_with_contexts": questions_with_contexts}
+        output = {"questions_with_contexts": ListField(questions_with_contexts)}
         if coreferents is not None:
-            output["answers"] = qa_answers
+            output["answers"] = ListField(qa_answers)
         return output
 
     @staticmethod
