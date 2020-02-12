@@ -20,11 +20,11 @@ class SpanField(Field[torch.Tensor]):
         The index of the start of the span in the :class:`SequenceField`.
     span_end : `int`, required.
         The inclusive index of the end of the span in the :class:`SequenceField`.
-    sequence_field : `SequenceField`, required.
+    sequence_field : `SequenceField`, optional.
         A field containing the sequence that this `SpanField` is a span inside.
     """
 
-    def __init__(self, span_start: int, span_end: int, sequence_field: SequenceField) -> None:
+    def __init__(self, span_start: int, span_end: int, sequence_field: SequenceField = None) -> None:
         self.span_start = span_start
         self.span_end = span_end
         self.sequence_field = sequence_field
@@ -40,7 +40,7 @@ class SpanField(Field[torch.Tensor]):
                 f"span_start must be less than span_end, " f"but found ({span_start}, {span_end})."
             )
 
-        if span_end > self.sequence_field.sequence_length() - 1:
+        if sequence_field is not None and span_end > self.sequence_field.sequence_length() - 1:
             raise ValueError(
                 f"span_end must be <= len(sequence_length) - 1, but found "
                 f"{span_end} and {self.sequence_field.sequence_length() - 1} respectively."
@@ -59,7 +59,7 @@ class SpanField(Field[torch.Tensor]):
 
     @overrides
     def empty_field(self):
-        return SpanField(-1, -1, self.sequence_field.empty_field())
+        return SpanField(-1, -1, self.sequence_field.empty_field() if self.sequence_field is not None else None)
 
     def __str__(self) -> str:
         return f"SpanField with spans: ({self.span_start}, {self.span_end})."
