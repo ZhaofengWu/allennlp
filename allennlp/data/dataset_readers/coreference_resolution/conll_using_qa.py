@@ -4,7 +4,6 @@ import math
 from typing import Any, Dict, List, Optional, Tuple, DefaultDict, Set, Union
 
 from overrides import overrides
-import torch
 
 from allennlp.common.file_utils import cached_path
 from allennlp.data.dataset_readers.dataset_reader import DatasetReader
@@ -217,6 +216,7 @@ class ConllCorefQAReader(DatasetReader):
         metadata: Dict[str, Any] = {
             "original_text": flattened_sentences,
             "num_added_start_tokens": self._tokenizer.num_added_start_tokens,
+            "num_added_middle_tokens": self._tokenizer.num_added_middle_tokens,
             "num_added_end_tokens": self._tokenizer.num_added_end_tokens,
             "prepare_qa_input_function": lambda spans, vocab: self._prepare_qa_input(tokenized_sentences, spans, windows, vocab)
         }
@@ -255,57 +255,31 @@ class ConllCorefQAReader(DatasetReader):
         return windows
 
     def _prepare_qa_input(
-        self, tokenized_sentences: List[List[int]], spans: torch.LongTensor, context_windows: List[List[int]], vocab
-    ) -> Tuple[TextFieldTensors, torch.LongTensor]:
+        self, tokenized_sentences: List[List[int]], span: Tuple[int, int], context_windows: List[List[int]], vocab
+    ) -> TextFieldTensors:
         """
-        spans: (num_spans, 2)
+        span: (2,)
 
         # Returns
 
         (num_spans, num_segments, max_context_length)
-        (num_spans, num_segments, max_context_length, num_classes)
         """
-        num_spans = spans.size(0)
-        device = spans.device
-        spans_sentence_index = torch.zeros(num_spans, dtype=torch.long, device=device)
-        spans_relative_indices = torch.zeros_like(spans)
-        finished_spans = torch.zeros(num_spans, dtype=torch.bool, device=device)
-
-        sentence_offset = self._tokenizer.num_added_start_tokens
-        for sentence_idx, sentence in enumerate(tokenized_sentences):
-            unmasked_curr_sentence_spans = spans - len(sentence) < 0
-            curr_sentence_spans = (~finished_spans) & unmasked_curr_sentence_spans.all(1)
-            assert (curr_sentence_spans == (~finished_spans) & unmasked_curr_sentence_spans.any(1)).all()
-            spans_sentence_index[curr_sentence_spans] = sentence_idx
-            spans_relative_indices[curr_sentence_spans] = spans[curr_sentence_spans] - sentence_offset
-            finished_spans[curr_sentence_spans] = 1
-
-            spans -= len(sentence)
+        sentence_offset = 0
+        curr_sentence = None
+        for sentence in tokenized_sentences:
+            if sentence_offset <= span[0] <= span[1] < sentence_offset + len(sentence):
+                span = (span[0] - sentence_offset, span[1] - sentence_offset)
+                curr_sentence = sentence
+                break
             sentence_offset += len(sentence)
+        assert curr_sentence is not None
 
-        assert finished_spans.all()
-
-        all_questions_with_contexts: List[Field] = []
-
-        for sentence_idx, span in zip(spans_sentence_index, spans_relative_indices):
-            sentence = tokenized_sentences[sentence_idx]
-            span = tuple(span.tolist())
-            questions_with_contexts = self._prepare_single_qa_input(sentence, span, context_windows)
-            all_questions_with_contexts.append(questions_with_contexts)
-
-        input_field = ListField(all_questions_with_contexts)
-        input_field.index(vocab)
-        return input_field.as_tensor(input_field.get_padding_lengths())
-
-    def _prepare_single_qa_input(
-        self, curr_sentence: List[int], curr_span: Tuple[int, int], context_windows: List[List[int]]
-    ) -> Tuple[ListField[TextField], ListField[SequenceLabelField]]:
-        curr_span_start, curr_span_end = curr_span
+        span_start, span_end = span
         # Prepare question
-        question = curr_sentence[:curr_span_start] + [self._start_of_mention_id] + curr_sentence[curr_span_start:curr_span_end+1] + [self._end_of_mention_id] + curr_sentence[curr_span_end+1:]
+        question = curr_sentence[:span_start] + [self._start_of_mention_id] + curr_sentence[span_start:span_end+1] + [self._end_of_mention_id] + curr_sentence[span_end+1:]
         # Strip question from the end until hitting self._end_of_mention, then strip from the start
         n_tokens_to_strip = len(question) - self._effective_max_question_length
-        n_strip_at_end = min(n_tokens_to_strip, len(question) - curr_span_end + 1)
+        n_strip_at_end = min(n_tokens_to_strip, len(question) - span_end + 1)
         n_strip_at_start = n_tokens_to_strip - n_strip_at_end
         question = question[n_strip_at_start:-n_strip_at_end]
 
@@ -316,7 +290,10 @@ class ConllCorefQAReader(DatasetReader):
             question_with_context = TextField(tokens, self._token_indexers)
             questions_with_contexts.append(question_with_context)
 
-        return ListField(questions_with_contexts)
+        input_field = ListField(questions_with_contexts)
+
+        input_field.index(vocab)
+        return input_field.as_tensor(input_field.get_padding_lengths())
 
     @staticmethod
     def _normalize_word(word):
