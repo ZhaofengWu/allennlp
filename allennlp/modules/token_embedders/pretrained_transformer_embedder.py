@@ -66,23 +66,33 @@ class PretrainedTransformerEmbedder(TokenEmbedder):
 
         token_ids: torch.LongTensor
             Shape: [
-                batch_size, num_wordpieces if max_length is None else num_segment_concat_wordpieces
+                ..., num_wordpieces if max_length is None else num_segment_concat_wordpieces
             ].
             num_segment_concat_wordpieces is num_wordpieces plus special tokens inserted in the
             middle, e.g. the length of: "[CLS] A B C [SEP] [CLS] D E F [SEP]" (see indexer logic).
         mask: torch.LongTensor
-            Shape: [batch_size, num_wordpieces].
+            Shape: [..., num_wordpieces].
         type_ids: Optional[torch.LongTensor]
             Shape: [
-                batch_size, num_wordpieces if max_length is None else num_segment_concat_wordpieces
+                ..., num_wordpieces if max_length is None else num_segment_concat_wordpieces
             ].
         segment_concat_mask: Optional[torch.LongTensor]
-            Shape: [batch_size, num_segment_concat_wordpieces].
+            Shape: [..., num_segment_concat_wordpieces].
 
         # Returns:
 
-        Shape: [batch_size, num_wordpieces, embedding_size].
+        Shape: [..., num_wordpieces, embedding_size].
         """
+        leading_dimensions = token_ids.size()[:-1]
+        new_batch_size = 1
+        for i in leading_dimensions: new_batch_size *= i
+        token_ids = token_ids.reshape(new_batch_size, -1)
+        mask = mask.reshape(new_batch_size, -1)
+        if type_ids is not None:
+            type_ids = type_ids.reshape(new_batch_size, -1)
+        if segment_concat_mask is not None:
+            segment_concat_mask = segment_concat_mask.reshape(new_batch_size, -1)
+
 
         # Some of the huggingface transformers don't support type ids at all and crash when you supply them. For
         # others, you can supply a tensor of zeros, and if you don't, they act as if you did. There is no practical
@@ -103,9 +113,9 @@ class PretrainedTransformerEmbedder(TokenEmbedder):
             )
 
         transformer_mask = segment_concat_mask if self._max_length is not None else mask
-        # Shape: [batch_size, num_wordpieces, embedding_size],
+        # Shape: [new_batch_size, num_wordpieces, embedding_size],
         # or if self._max_length is not None:
-        # [batch_size * num_segments, self._max_length, embedding_size]
+        # [new_batch_size * num_segments, self._max_length, embedding_size]
 
         # We call this with kwargs because some of the huggingface models don't have the token_type_ids parameter
         # and fail even when it's given as None.
@@ -119,7 +129,8 @@ class PretrainedTransformerEmbedder(TokenEmbedder):
                 embeddings, segment_concat_mask, batch_size, num_segment_concat_wordpieces
             )
 
-        return embeddings
+        orig_shape = leading_dimensions + embeddings.shape[1:]
+        return embeddings.reshape(*orig_shape)
 
     def _fold_long_sequences(
         self,

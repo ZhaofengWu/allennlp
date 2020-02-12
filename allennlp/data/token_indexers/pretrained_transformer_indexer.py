@@ -142,7 +142,7 @@ class PretrainedTransformerIndexer(TokenIndexer):
         The input should have a `"token_ids"` key corresponding to the token indices. They should
         have special tokens already inserted.
         """
-        if self._max_length is not None and len(output["token_ids"]) > self._effective_max_length:
+        if self._max_length is not None:
             # We prepare long indices by converting them to (assuming max_length == 5)
             # [CLS] A B C [SEP] [CLS] D E F [SEP] ...
             # Embedder is responsible for folding this 1-d sequence to 2-d and feed to the
