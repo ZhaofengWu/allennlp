@@ -99,20 +99,21 @@ class ConllCorefQAReader(DatasetReader):
         max_span_width: int,
         transformer_model_name: str,
         max_question_length: int = 128,
-        indexer_kwargs: Dict[str, Any] = None,
+        max_context_length: int = 384,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
 
-        indexer_kwargs = indexer_kwargs or {}
-        self._token_indexer = PretrainedTransformerIndexer(transformer_model_name, **indexer_kwargs)
+        self._token_indexer = PretrainedTransformerIndexer(transformer_model_name)
         self._token_indexers = {"tokens": self._token_indexer}
         self._tokenizer = self._token_indexer._allennlp_tokenizer
 
         self._max_span_width = max_span_width
         self._max_question_length = max_question_length
-        self._max_qa_length = self._token_indexer._max_length
-        assert self._max_question_length < self._max_qa_length
+        self._max_context_length = max_context_length
+
+        self._effective_max_context_length = self._max_context_length - self._tokenizer.num_added_start_tokens - self._tokenizer.num_added_end_tokens
+        self._effective_max_question_length = self._max_question_length - self._tokenizer.num_added_middle_tokens
 
         self._start_of_mention = "<mention>"
         self._end_of_mention = "</mention>"
@@ -175,10 +176,11 @@ class ConllCorefQAReader(DatasetReader):
         sentences = [[self._normalize_word(word) for word in sentence] for sentence in sentences]
         flattened_sentences = [word for sentence in sentences for word in sentence]
 
-        tokenized_sentences, offsets, flat_sentences_tokens = self._intra_word_tokenize_sentences(sentences)
-        flattened_sentences = [t.text for t in flat_sentences_tokens]
+        tokenized_sentences, offsets = self._intra_word_tokenize_sentences(sentences)
+        flattened_tokenized_sentences = [token for sentence in tokenized_sentences for token in sentence]
 
-        text_field = TextField(flat_sentences_tokens, self._token_indexers)
+        windows = self._create_windows(flattened_tokenized_sentences, self._effective_max_context_length)
+        text_field = ListField([TextField(self._tokenizer.ids_to_tokens(window), self._token_indexers) for window in windows])
 
         cluster_dict: Optional[Dict[Tuple[int, int], int]] = None
         if gold_clusters is not None:
@@ -201,19 +203,12 @@ class ConllCorefQAReader(DatasetReader):
             for start, end in enumerate_spans(
                 tokenized_sentence, offset=sentence_offset, max_span_width=self._max_span_width
             ):
-                # We also don't generate spans that contain special tokens
-                if start < self._tokenizer.num_added_start_tokens:
-                    continue
-                if end >= len(flat_sentences_tokens) - self._tokenizer.num_added_end_tokens:
-                    continue
-
+                spans.append(SpanField(start, end))
                 if span_labels is not None:
                     if cluster_dict and (start, end) in cluster_dict:
                         span_labels.append(cluster_dict[(start, end)])
                     else:
                         span_labels.append(-1)
-
-                spans.append(SpanField(start, end, text_field))
 
             sentence_offset += len(tokenized_sentence)
 
@@ -221,7 +216,9 @@ class ConllCorefQAReader(DatasetReader):
 
         metadata: Dict[str, Any] = {
             "original_text": flattened_sentences,
-            "prepare_qa_input_function": lambda spans, vocab: self._prepare_qa_input(tokenized_sentences, spans, vocab)
+            "num_added_start_tokens": self._tokenizer.num_added_start_tokens,
+            "num_added_end_tokens": self._tokenizer.num_added_end_tokens,
+            "prepare_qa_input_function": lambda spans, vocab: self._prepare_qa_input(tokenized_sentences, spans, windows, vocab)
         }
         if gold_clusters is not None:
             metadata["clusters"] = gold_clusters
@@ -238,7 +235,7 @@ class ConllCorefQAReader(DatasetReader):
         return Instance(fields)
 
     def _intra_word_tokenize_sentences(self, sentences: List[List[str]]):
-        sentence_offset = self._tokenizer.num_added_start_tokens
+        sentence_offset = 0
         tokenized_sentences = []
         all_wordpiece_offsets = []
         for sentence in sentences:
@@ -247,21 +244,26 @@ class ConllCorefQAReader(DatasetReader):
             all_wordpiece_offsets.extend(wordpiece_offsets)
             sentence_offset += len(tokenized_sentence)
 
-        flat_sentences_tokens = self._tokenizer.ids_to_tokens([word for sentence in tokenized_sentences for word in sentence])
-        assert sentence_offset + self._tokenizer.num_added_end_tokens == len(flat_sentences_tokens)
+        return tokenized_sentences, all_wordpiece_offsets
 
-        return tokenized_sentences, all_wordpiece_offsets, flat_sentences_tokens
+    def _create_windows(self, ids: List[int], max_length: int) -> List[List[int]]:
+        windows = []
+        for i in range(math.ceil(len(ids) / max_length)):
+            window_start = i * max_length
+            window_end = (i + 1) * max_length  # exclusive
+            windows.append(ids[window_start:window_end])
+        return windows
 
     def _prepare_qa_input(
-        self, tokenized_sentences: List[List[int]], spans: torch.LongTensor, vocab
+        self, tokenized_sentences: List[List[int]], spans: torch.LongTensor, context_windows: List[List[int]], vocab
     ) -> Tuple[TextFieldTensors, torch.LongTensor]:
         """
         spans: (num_spans, 2)
 
         # Returns
 
-        (num_spans, num_segments, max_qa_length)
-        (num_spans, num_segments, max_qa_length, num_classes)
+        (num_spans, num_segments, max_context_length)
+        (num_spans, num_segments, max_context_length, num_classes)
         """
         num_spans = spans.size(0)
         device = spans.device
@@ -283,15 +285,12 @@ class ConllCorefQAReader(DatasetReader):
 
         assert finished_spans.all()
 
-        tokenized_context = [token for sentence in tokenized_sentences for token in sentence]
-
         all_questions_with_contexts: List[Field] = []
 
         for sentence_idx, span in zip(spans_sentence_index, spans_relative_indices):
             sentence = tokenized_sentences[sentence_idx]
             span = tuple(span.tolist())
-
-            questions_with_contexts = self._prepare_single_qa_input(sentence, tokenized_context, span)
+            questions_with_contexts = self._prepare_single_qa_input(sentence, span, context_windows)
             all_questions_with_contexts.append(questions_with_contexts)
 
         input_field = ListField(all_questions_with_contexts)
@@ -299,29 +298,21 @@ class ConllCorefQAReader(DatasetReader):
         return input_field.as_tensor(input_field.get_padding_lengths())
 
     def _prepare_single_qa_input(
-        self, curr_sentence: List[int], context: List[int], curr_span: Tuple[int, int]
+        self, curr_sentence: List[int], curr_span: Tuple[int, int], context_windows: List[List[int]]
     ) -> Tuple[ListField[TextField], ListField[SequenceLabelField]]:
         curr_span_start, curr_span_end = curr_span
         # Prepare question
         question = curr_sentence[:curr_span_start] + [self._start_of_mention_id] + curr_sentence[curr_span_start:curr_span_end+1] + [self._end_of_mention_id] + curr_sentence[curr_span_end+1:]
         # Strip question from the end until hitting self._end_of_mention, then strip from the start
-        n_tokens_to_strip = len(question) - self._max_question_length
+        n_tokens_to_strip = len(question) - self._effective_max_question_length
         n_strip_at_end = min(n_tokens_to_strip, len(question) - curr_span_end + 1)
         n_strip_at_start = n_tokens_to_strip - n_strip_at_end
         question = question[n_strip_at_start:-n_strip_at_end]
 
         # Prepare context and answers
-        n_added_tokens = self._tokenizer.num_added_start_tokens + self._tokenizer.num_added_middle_tokens + self._tokenizer.num_added_end_tokens
-        max_context_length = self._max_qa_length - len(question) - n_added_tokens
-
-        # Windowing
         questions_with_contexts: List[Field] = []
-        for i in range(math.ceil(len(context) / max_context_length)):
-            segment_start = i * max_context_length
-            segment_end = (i + 1) * max_context_length  # exclusive
-            context_segment = context[segment_start:segment_end]
-
-            tokens = self._tokenizer.ids_to_tokens(question, context_segment)
+        for context_window in context_windows:
+            tokens = self._tokenizer.ids_to_tokens(question, context_window)
             question_with_context = TextField(tokens, self._token_indexers)
             questions_with_contexts.append(question_with_context)
 
