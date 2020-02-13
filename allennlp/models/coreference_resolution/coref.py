@@ -309,7 +309,7 @@ class CoreferenceResolver(Model):
 
             self._mention_recall(top_spans, metadata)
             self._conll_coref_scores(
-                top_spans, valid_antecedent_indices, predicted_antecedents, metadata
+                top_spans, valid_antecedent_indices.expand_as(predicted_antecedents.shape), predicted_antecedents, metadata
             )
 
             output_dict["loss"] = negative_marginal_log_likelihood

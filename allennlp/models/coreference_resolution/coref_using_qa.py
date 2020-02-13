@@ -9,7 +9,7 @@ from overrides import overrides
 from allennlp.data import TextFieldTensors, Vocabulary
 from allennlp.models.model import Model
 from allennlp.modules.text_field_embedders import BasicTextFieldEmbedder
-from allennlp.modules.token_embedders import Embedding, PretrainedTransformerEmbedder, PretrainedTransformerMismatchedEmbedder
+from allennlp.modules.token_embedders import Embedding, PretrainedTransformerEmbedder
 from allennlp.modules import FeedForward
 from allennlp.modules import Seq2SeqEncoder, TimeDistributed, Pruner
 from allennlp.modules.span_extractors import SelfAttentiveSpanExtractor, EndpointSpanExtractor
@@ -76,34 +76,34 @@ class CoreferenceQAResolver(Model):
         wordpiece_modeling: bool = True,
         lexical_dropout: float = 0.2,
         initializer: InitializerApplicator = InitializerApplicator(),
-        embeder_kwargs: Dict[str, Any] = None,
         **kwargs
     ) -> None:
         super().__init__(vocab, **kwargs)
 
-        base_embeder_cls = PretrainedTransformerEmbedder if self._wordpiece_modeling else PretrainedTransformerMismatchedEmbedder
-        qa_embeder_cls = PretrainedTransformerEmbedder  # have to do matched version for QA
-        embeder_kwargs = embeder_kwargs or {}
-
-        self._base_embedder = base_embeder_cls(transformer_model_name, **embeder_kwargs)
-        self._qa_embedder = qa_embeder_cls(transformer_model_name, **embeder_kwargs)
+        self._text_embedder = PretrainedTransformerEmbedder(transformer_model_name)
         # Add <mention> and </mention> to vocabulary
-        curr_vocab_size = self._base_embedder.transformer_model.config.vocab_size
-        self._base_embedder.transformer_model.resize_token_embeddings(curr_vocab_size + 2)
-        self._qa_embedder.transformer_model = self._base_embedder.transformer_model  # share params
-        self._base_embedder = {"tokens": self._base_embedder}
-        self._qa_embedder = {"tokens": self._qa_embedder}
+        curr_vocab_size = self._text_embedder.transformer_model.config.vocab_size
+        self._text_embedder.transformer_model.resize_token_embeddings(curr_vocab_size + 2)
+        self._text_embedders = BasicTextFieldEmbedder({"tokens": self._text_embedder})
 
         self._context_layer = context_layer
-        self._antecedent_feedforward = TimeDistributed(antecedent_feedforward)
-        feedforward_scorer = torch.nn.Sequential(
+
+        mention_feedforward_scorer = torch.nn.Sequential(
             TimeDistributed(mention_feedforward),
             TimeDistributed(torch.nn.Linear(mention_feedforward.get_output_dim(), 1)),
         )
-        self._mention_pruner = Pruner(feedforward_scorer)
-        self._antecedent_scorer = TimeDistributed(
-            torch.nn.Linear(antecedent_feedforward.get_output_dim(), 1)
+        self._mention_pruner = Pruner(mention_feedforward_scorer)
+
+        antecedent_feedforward_scorer = torch.nn.Sequential(
+            TimeDistributed(antecedent_feedforward),
+            TimeDistributed(torch.nn.Linear(antecedent_feedforward.get_output_dim(), 1)),
         )
+        self._antecedent_pruner = Pruner(antecedent_feedforward_scorer)
+
+        # self._antecedent_feedforward = TimeDistributed(antecedent_feedforward)
+        # self._antecedent_scorer = TimeDistributed(
+        #     torch.nn.Linear(antecedent_feedforward.get_output_dim(), 1)
+        # )
 
         self._endpoint_span_extractor = EndpointSpanExtractor(
             context_layer.get_output_dim(),
@@ -113,7 +113,7 @@ class CoreferenceQAResolver(Model):
             bucket_widths=False,
         )
         self._attentive_span_extractor = SelfAttentiveSpanExtractor(
-            input_dim=text_field_embedder.get_output_dim()
+            input_dim=self._text_embedders.get_output_dim()
         )
 
         # 10 possible distance buckets.
@@ -137,10 +137,8 @@ class CoreferenceQAResolver(Model):
         self,  # type: ignore
         text: TextFieldTensors,
         spans: torch.IntTensor,
-        questions_with_contexts: TextFieldTensors,
-        answers: TextFieldTensors,
+        metadata: List[Dict[str, Any]],
         span_labels: torch.IntTensor = None,
-        metadata: List[Dict[str, Any]] = None,
     ) -> Dict[str, torch.Tensor]:
 
         """
@@ -177,15 +175,30 @@ class CoreferenceQAResolver(Model):
         loss : `torch.FloatTensor`, optional
             A scalar loss to be optimised.
         """
-        breakpoint()
-        # Shape: (batch_size, document_length, embedding_size)
-        text_embeddings = self._lexical_dropout(self._text_field_embedder(text))
-
-        document_length = text_embeddings.size(1)
+        device = spans.device
+        batch_size = spans.size(0)
         num_spans = spans.size(1)
 
-        # Shape: (batch_size, document_length)
+        num_added_start_tokens = metadata[0]["num_added_start_tokens"]
+        num_added_end_tokens = metadata[0]["num_added_end_tokens"]
+
+        # Shape: (batch_size, n_windows, window_length, embedding_size)
+        print(torch.cuda.memory_allocated())
+        text_embeddings = self._lexical_dropout(self._text_embedders(text))
+        print(torch.cuda.memory_allocated())
+        raise
+        # Shape: (batch_size, n_windows, window_length)
         text_mask = util.get_text_field_mask(text).float()
+
+        text_embeddings = text_embeddings[:, :, num_added_start_tokens:-num_added_end_tokens, :]
+        text_mask = text_mask[:, :, num_added_start_tokens+num_added_end_tokens:]
+
+        text_embeddings = text_embeddings.reshape(batch_size, -1, text_embeddings.size(-1))
+        text_mask = text_mask.reshape(batch_size, -1)
+
+        document_length = text_mask.long().sum(dim=1).max()
+        text_embeddings = text_embeddings[:, :document_length, :]
+        text_mask = text_mask[:, :document_length]
 
         # Shape: (batch_size, num_spans)
         span_mask = (spans[:, :, 0] >= 0).squeeze(-1).float()
@@ -213,12 +226,12 @@ class CoreferenceQAResolver(Model):
         num_spans_to_keep = int(math.floor(self._spans_per_word * document_length))
 
         (
-            top_span_embeddings,
+            _,
             top_span_mask,
             top_span_indices,
             top_span_mention_scores,
         ) = self._mention_pruner(span_embeddings, span_mask, num_spans_to_keep)
-        top_span_mask = top_span_mask.unsqueeze(-1)
+
         # Shape: (batch_size * num_spans_to_keep)
         # torch.index_select only accepts 1D indices, but here
         # we need to select spans for each element in the batch.
@@ -234,53 +247,100 @@ class CoreferenceQAResolver(Model):
         # Compute indices for antecedent spans to consider.
         max_antecedents = min(self._max_antecedents, num_spans_to_keep)
 
-        # Now that we have our variables in terms of num_spans_to_keep, we need to
-        # compare span pairs to decide each span's antecedent. Each span can only
-        # have prior spans as antecedents, and we only consider up to max_antecedents
-        # prior spans. So the first thing we do is construct a matrix mapping a span's
-        #  index to the indices of its allowed antecedents. Note that this is independent
-        #  of the batch dimension - it's just a function of the span's position in
-        # top_spans. The spans are in document order, so we can just use the relative
-        # index of the spans to know which other spans are allowed antecedents.
+        # This huge outer loop seems horrible but since the batch size if often just 1, it's fine
+        all_antecedent_indices = []
+        all_coref_scores = []
+        for i, (batch_top_spans, batch_top_span_mention_scores) in enumerate(zip(top_spans, top_span_mention_scores)):
+            prepare_qa_input_function = metadata[i]["prepare_qa_input_function"]
+            all_embedded_context = []
 
-        # Once we have this matrix, we reformat our variables again to get embeddings
-        # for all valid antecedents for each span. This gives us variables with shapes
-        #  like (batch_size, num_spans_to_keep, max_antecedents, embedding_size), which
-        #  we can use to make coreference decisions between valid span pairs.
+            batch_context_length = None
+            print(len(batch_top_spans))
+            for span in batch_top_spans:
+                print('span')
+                qa_input_field = prepare_qa_input_function(span, self.vocab)
+                print(torch.cuda.memory_allocated())
+                qa_input_field = util.move_to_device(qa_input_field, util.get_device_of(spans))
+                print(torch.cuda.memory_allocated())
+                # (num_windows, window_length, embedding_size)
+                embedded_qa_input = self._lexical_dropout(self._text_embedders(qa_input_field))
+                print(embedded_qa_input.shape)
+                print(torch.cuda.memory_allocated())
+                # (num_windows, window_length)
+                type_ids = qa_input_field["tokens"]["type_ids"]
+                print(torch.cuda.memory_allocated())
 
-        # Shapes:
-        # (num_spans_to_keep, max_antecedents),
-        # (1, max_antecedents),
-        # (1, num_spans_to_keep, max_antecedents)
-        (
-            valid_antecedent_indices,
-            valid_antecedent_offsets,
-            valid_antecedent_log_mask,
-        ) = self._generate_valid_antecedents(  # noqa
-            num_spans_to_keep, max_antecedents, util.get_device_of(text_mask)
-        )
-        # Select tensors relating to the antecedent spans.
-        # Shape: (batch_size, num_spans_to_keep, max_antecedents, embedding_size)
-        candidate_antecedent_embeddings = util.flattened_index_select(
-            top_span_embeddings, valid_antecedent_indices
-        )
+                print('-----')
 
-        # Shape: (batch_size, num_spans_to_keep, max_antecedents)
-        candidate_antecedent_mention_scores = util.flattened_index_select(
-            top_span_mention_scores, valid_antecedent_indices
-        ).squeeze(-1)
-        # Compute antecedent scores.
-        # Shape: (batch_size, num_spans_to_keep, max_antecedents, embedding_size)
-        span_pair_embeddings = self._compute_span_pair_embeddings(
-            top_span_embeddings, candidate_antecedent_embeddings, valid_antecedent_offsets
-        )
+                # (context_length + n_end_tokens, 2)
+                context_indices = type_ids.nonzero()
+                print(torch.cuda.memory_allocated())
+                context_length = context_indices.size(0) - type_ids.size(0) * num_added_end_tokens
+                print(torch.cuda.memory_allocated())
+                if batch_context_length is not None:
+                    assert context_length == batch_context_length
+                else:
+                    batch_context_length = context_length
+                print(torch.cuda.memory_allocated())
+
+                print('======')
+
+                context_start = context_indices[0, 1]
+                print(torch.cuda.memory_allocated())
+                context_end = context_indices[:, 1].max() - num_added_end_tokens  # inclusive
+                print(torch.cuda.memory_allocated())
+                window_context_length = context_end - context_start + 1
+                print(torch.cuda.memory_allocated())
+
+                print('-=-=-=')
+
+                offset = 0
+                while True:
+                    offset += window_context_length + num_added_end_tokens
+                    if offset >= len(context_indices):
+                        break
+                    assert context_indices[offset, 1] == context_start
+                    assert context_indices[offset - 1, 1] - num_added_end_tokens == context_end
+                print(torch.cuda.memory_allocated())
+
+                # (num_windows, window_context_length, embedding_size)
+                embedded_context = embedded_qa_input[:, context_start:context_end+1, :]
+                print(torch.cuda.memory_allocated())
+                # (context_length, embedding_size)
+                embedded_context = embedded_context.reshape(-1, embedded_context.size(2))[:context_length, :]
+                print(torch.cuda.memory_allocated())
+                all_embedded_context.append(embedded_context)
+                print(torch.cuda.memory_allocated())
+
+                print('done loop')
+
+            # (num_spans_to_keep, context_length, embedding_size)
+            all_embedded_context = torch.stack(all_embedded_context, dim=0)
+            # (num_spans_to_keep, num_spans_to_keep, 2 * embedding_size)
+            antecedent_embeddings = self._endpoint_span_extractor(all_embedded_context, batch_top_spans)
+
+            (
+                _,
+                top_antecedent_mask,
+                top_antecedent_indices,  # (num_spans_to_keep, max_antecedents)
+                top_antecedent_scores,  # (num_spans_to_keep, max_antecedents, 1)
+            ) = self._antecedent_pruner(antecedent_embeddings, torch.ones(num_spans_to_keep, num_spans_to_keep, dtype=torch.long, device=device), max_antecedents)
+            assert (top_antecedent_mask == 1).all()
+
+            # ((num_spans_to_keep, max_antecedents, 1))
+            antecedent_mention_scores = util.flattened_index_select(batch_top_span_mention_scores.unsqueeze(0), top_antecedent_indices).squeeze(0)
+            coref_scores = (top_antecedent_scores + antecedent_mention_scores).squeeze(-1)
+            dummy_scores = coref_scores.new_zeros(coref_scores.size(0), coref_scores.size(1), 1)
+
+            # Shape: (num_spans_to_keep, max_antecedents + 1)
+            coref_scores = torch.cat([dummy_scores, coref_scores], -1)
+            all_coref_scores.append(coref_scores)
+            all_antecedent_indices.append(top_span_indices)
+
         # Shape: (batch_size, num_spans_to_keep, 1 + max_antecedents)
-        coreference_scores = self._compute_coreference_scores(
-            span_pair_embeddings,
-            top_span_mention_scores,
-            candidate_antecedent_mention_scores,
-            valid_antecedent_log_mask,
-        )
+        coreference_scores = torch.stack(all_coref_scores, dim=0)
+        # Shape: (batch_size, num_spans_to_keep, max_antecedents)
+        valid_antecedent_indices = torch.stack(all_antecedent_indices, dim=0)
 
         # We now have, for each span which survived the pruning stage,
         # a predicted antecedent. This implies a clustering if we group
@@ -303,10 +363,9 @@ class CoreferenceQAResolver(Model):
                 span_labels.unsqueeze(-1), top_span_indices, flat_top_span_indices
             )
 
-            antecedent_labels = util.flattened_index_select(
-                pruned_gold_labels, valid_antecedent_indices
-            ).squeeze(-1)
-            antecedent_labels += valid_antecedent_log_mask.long()
+            antecedent_labels = torch.stack([util.flattened_index_select(
+                pruned_gold_labels, antecedent_indices
+            ).squeeze(-1) for antecedent_indices in valid_antecedent_indices])
 
             # Compute labels.
             # Shape: (batch_size, num_spans_to_keep, max_antecedents + 1)
@@ -323,6 +382,7 @@ class CoreferenceQAResolver(Model):
             # probability assigned to all valid antecedents. This is a valid objective for
             # clustering as we don't mind which antecedent is predicted, so long as they are in
             #  the same coreference cluster.
+            top_span_mask = top_span_mask.unsqueeze(-1)
             coreference_log_probs = util.masked_log_softmax(coreference_scores, top_span_mask)
             correct_antecedent_log_probs = coreference_log_probs + gold_antecedent_labels.log()
             negative_marginal_log_likelihood = -util.logsumexp(correct_antecedent_log_probs).sum()
@@ -368,15 +428,15 @@ class CoreferenceQAResolver(Model):
         # the index can be -1, specifying that the span has no predicted antecedent.
         batch_predicted_antecedents = output_dict["predicted_antecedents"].detach().cpu()
 
-        # A tensor of shape (num_spans_to_keep, max_antecedents), representing the indices
+        # A tensor of shape (batch_size, num_spans_to_keep, max_antecedents), representing the indices
         # of the predicted antecedents with respect to the 2nd dimension of `batch_top_spans`
         # for each antecedent we considered.
-        antecedent_indices = output_dict["antecedent_indices"].detach().cpu()
+        batch_antecedent_indices = output_dict["antecedent_indices"].detach().cpu()
         batch_clusters: List[List[List[Tuple[int, int]]]] = []
 
         # Calling zip() on two tensors results in an iterator over their
         # first dimension. This is iterating over instances in the batch.
-        for top_spans, predicted_antecedents in zip(batch_top_spans, batch_predicted_antecedents):
+        for top_spans, antecedent_indices, predicted_antecedents in zip(batch_top_spans, batch_antecedent_indices, batch_predicted_antecedents):
             spans_to_cluster_ids: Dict[Tuple[int, int], int] = {}
             clusters: List[List[Tuple[int, int]]] = []
 

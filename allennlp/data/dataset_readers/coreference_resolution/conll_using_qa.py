@@ -216,7 +216,6 @@ class ConllCorefQAReader(DatasetReader):
         metadata: Dict[str, Any] = {
             "original_text": flattened_sentences,
             "num_added_start_tokens": self._tokenizer.num_added_start_tokens,
-            "num_added_middle_tokens": self._tokenizer.num_added_middle_tokens,
             "num_added_end_tokens": self._tokenizer.num_added_end_tokens,
             "prepare_qa_input_function": lambda spans, vocab: self._prepare_qa_input(tokenized_sentences, spans, windows, vocab)
         }
