@@ -183,10 +183,11 @@ class CoreferenceQAResolver(Model):
         num_added_end_tokens = metadata[0]["num_added_end_tokens"]
 
         # Shape: (batch_size, n_windows, window_length, embedding_size)
-        print(torch.cuda.memory_allocated())
+        # print(torch.cuda.memory_allocated())
         text_embeddings = self._lexical_dropout(self._text_embedders(text))
-        print(torch.cuda.memory_allocated())
-        raise
+        print(text_embeddings.shape)
+        # print(torch.cuda.memory_allocated())
+        # raise
         # Shape: (batch_size, n_windows, window_length)
         text_mask = util.get_text_field_mask(text).float()
 
@@ -196,6 +197,7 @@ class CoreferenceQAResolver(Model):
         text_embeddings = text_embeddings.reshape(batch_size, -1, text_embeddings.size(-1))
         text_mask = text_mask.reshape(batch_size, -1)
 
+        breakpoint()
         document_length = text_mask.long().sum(dim=1).max()
         text_embeddings = text_embeddings[:, :document_length, :]
         text_mask = text_mask[:, :document_length]
@@ -247,7 +249,7 @@ class CoreferenceQAResolver(Model):
         # Compute indices for antecedent spans to consider.
         max_antecedents = min(self._max_antecedents, num_spans_to_keep)
 
-        # This huge outer loop seems horrible but since the batch size if often just 1, it's fine
+        # This huge outer loop seems horrible but since the batch size is often just 1, it's fine
         all_antecedent_indices = []
         all_coref_scores = []
         for i, (batch_top_spans, batch_top_span_mention_scores) in enumerate(zip(top_spans, top_span_mention_scores)):
@@ -327,7 +329,7 @@ class CoreferenceQAResolver(Model):
             ) = self._antecedent_pruner(antecedent_embeddings, torch.ones(num_spans_to_keep, num_spans_to_keep, dtype=torch.long, device=device), max_antecedents)
             assert (top_antecedent_mask == 1).all()
 
-            # ((num_spans_to_keep, max_antecedents, 1))
+            # (num_spans_to_keep, max_antecedents, 1)
             antecedent_mention_scores = util.flattened_index_select(batch_top_span_mention_scores.unsqueeze(0), top_antecedent_indices).squeeze(0)
             coref_scores = (top_antecedent_scores + antecedent_mention_scores).squeeze(-1)
             dummy_scores = coref_scores.new_zeros(coref_scores.size(0), coref_scores.size(1), 1)
