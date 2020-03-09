@@ -82,6 +82,8 @@ class CoreferenceResolver(Model):
     ) -> None:
         super().__init__(vocab, **kwargs)
 
+        max_span_width = 90
+
         self._text_field_embedder = text_field_embedder
         self._context_layer = context_layer
         self._mention_feedforward = TimeDistributed(mention_feedforward)
@@ -136,7 +138,9 @@ class CoreferenceResolver(Model):
         self,  # type: ignore
         text: TextFieldTensors,
         spans: torch.IntTensor,
+        gold_spans: torch.IntTensor,
         span_labels: torch.IntTensor = None,
+        gold_span_labels: torch.IntTensor = None,
         metadata: List[Dict[str, Any]] = None,
     ) -> Dict[str, torch.Tensor]:
 
@@ -186,6 +190,7 @@ class CoreferenceResolver(Model):
 
         # Shape: (batch_size, num_spans)
         span_mask = (spans[:, :, 0] >= 0).squeeze(-1)
+        gold_span_mask = (gold_spans[:, :, 0] >= 0).squeeze(-1)
         # SpanFields return -1 when they are used as padding. As we do
         # some comparisons based on span widths when we attend over the
         # span representations that we generate from these indices, we
@@ -195,16 +200,20 @@ class CoreferenceResolver(Model):
         # consider a masked span.
         # Shape: (batch_size, num_spans, 2)
         spans = F.relu(spans.float()).long()
+        gold_spans = F.relu(gold_spans.float()).long()
 
         # Shape: (batch_size, document_length, encoding_dim)
         contextualized_embeddings = self._context_layer(text_embeddings, text_mask)
         # Shape: (batch_size, num_spans, 2 * encoding_dim + feature_size)
         endpoint_span_embeddings = self._endpoint_span_extractor(contextualized_embeddings, spans)
+        endpoint_gold_span_embeddings = self._endpoint_span_extractor(contextualized_embeddings, gold_spans)
         # Shape: (batch_size, num_spans, emebedding_size)
         attended_span_embeddings = self._attentive_span_extractor(text_embeddings, spans)
+        attended_gold_span_embeddings = self._attentive_span_extractor(text_embeddings, gold_spans)
 
         # Shape: (batch_size, num_spans, emebedding_size + 2 * encoding_dim + feature_size)
         span_embeddings = torch.cat([endpoint_span_embeddings, attended_span_embeddings], -1)
+        gold_span_embeddings = torch.cat([endpoint_gold_span_embeddings, attended_gold_span_embeddings], -1)
 
         # Prune based on mention scores.
         num_spans_to_keep = int(math.floor(self._spans_per_word * document_length))
@@ -214,7 +223,10 @@ class CoreferenceResolver(Model):
         span_mention_scores = self._mention_scorer(
             self._mention_feedforward(span_embeddings)
         ).squeeze(-1)
-        # Shape: (batch_size, num_spans) for all 3 tensors
+        gold_span_mention_scores = self._mention_scorer(
+            self._mention_feedforward(gold_span_embeddings)
+        ).squeeze(-1)
+        # Shape: (batch_size, num_spans_to_keep) for all 3 tensors
         top_span_mention_scores, top_span_mask, top_span_indices = util.masked_topk(
             span_mention_scores, span_mask, num_spans_to_keep
         )
@@ -234,6 +246,27 @@ class CoreferenceResolver(Model):
         top_span_embeddings = util.batched_index_select(
             span_embeddings, top_span_indices, flat_top_span_indices
         )
+        # Find the gold labels for the spans which we kept.
+        # Shape: (batch_size, num_spans_to_keep, 1)
+        pruned_gold_labels = util.batched_index_select(
+            span_labels.unsqueeze(-1), top_span_indices, flat_top_span_indices
+        )
+
+        incorrect_top_spans_mask = pruned_gold_labels.squeeze(-1) < 0
+
+        incorrect_top_spans = top_spans[incorrect_top_spans_mask].unsqueeze(0)
+        incorrect_top_span_embeddings = top_span_embeddings[incorrect_top_spans_mask].unsqueeze(0)
+        incorrect_top_span_mention_scores = top_span_mention_scores[incorrect_top_spans_mask].unsqueeze(0)
+        incorrect_top_span_mask = top_span_mask[incorrect_top_spans_mask].unsqueeze(0)
+        incorrect_gold_labels = pruned_gold_labels[incorrect_top_spans_mask].unsqueeze(0)
+
+        top_spans = torch.cat([incorrect_top_spans, gold_spans], 1)
+        top_span_embeddings = torch.cat([incorrect_top_span_embeddings, gold_span_embeddings], 1)
+        top_span_mention_scores = torch.cat([incorrect_top_span_mention_scores, gold_span_mention_scores], 1)
+        top_span_mask = torch.cat([incorrect_top_span_mask, gold_span_mask], 1)
+        pruned_gold_labels = torch.cat([incorrect_gold_labels, gold_span_labels.unsqueeze(-1)], 1)
+
+        num_spans_to_keep = top_span_mention_scores.shape[1]
 
         # Compute indices for antecedent spans to consider.
         max_antecedents = min(self._max_antecedents, num_spans_to_keep)
@@ -333,12 +366,6 @@ class CoreferenceResolver(Model):
             "predicted_antecedents": predicted_antecedents,
         }
         if span_labels is not None:
-            # Find the gold labels for the spans which we kept.
-            # Shape: (batch_size, num_spans_to_keep, 1)
-            pruned_gold_labels = util.batched_index_select(
-                span_labels.unsqueeze(-1), top_span_indices, flat_top_span_indices
-            )
-
             # Shape: (batch_size, num_spans_to_keep, max_antecedents)
             antecedent_labels = util.batched_index_select(
                 pruned_gold_labels, top_antecedent_indices, flat_top_antecedent_indices

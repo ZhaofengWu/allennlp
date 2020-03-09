@@ -96,6 +96,7 @@ def make_coref_instance(
     cluster_dict = {}
     if gold_clusters is not None:
         gold_clusters = _canonicalize_clusters(gold_clusters)
+        original_clusters = gold_clusters
         if remove_singleton_clusters:
             gold_clusters = [cluster for cluster in gold_clusters if len(cluster) > 1]
 
@@ -151,17 +152,24 @@ def make_coref_instance(
     span_field = ListField(spans)
 
     metadata: Dict[str, Any] = {"original_text": flattened_sentences}
+    def flatten(l):
+        return [e for subl in l for e in subl]
     if gold_clusters is not None:
         metadata["clusters"] = gold_clusters
     metadata_field = MetadataField(metadata)
 
+    gold_span_field = ListField([SpanField(start, end, text_field) for start, end in flatten(original_clusters)])
+    gold_span_label_field = SequenceLabelField([cluster_dict.get((start, end), -1) for start, end in flatten(original_clusters)], gold_span_field)
+
     fields: Dict[str, Field] = {
         "text": text_field,
         "spans": span_field,
+        "gold_spans": gold_span_field,
         "metadata": metadata_field,
     }
     if span_labels is not None:
         fields["span_labels"] = SequenceLabelField(span_labels, span_field)
+        fields["gold_span_labels"] = gold_span_label_field
 
     return Instance(fields)
 
